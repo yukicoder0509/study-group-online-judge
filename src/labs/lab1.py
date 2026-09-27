@@ -71,6 +71,8 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
     x = ln_1(x) # 1024 * 768
 
     # Self attention block
+    n_head, head_dim, T = 12, 64, x.size(0)
+
     W = model_weights[f"h.{layer_idx}.attn.c_attn.weight"] # 768 * 2304 = [Q K V]
     b = model_weights[f"h.{layer_idx}.attn.c_attn.bias"] # 2304
     proj_w = model_weights[f"h.{layer_idx}.attn.c_proj.weight"] # 768 * 768
@@ -79,10 +81,22 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
     qkv = torch.matmul(x, W) + b # 1024 * 2304
     Q, K, V = qkv.split(768, dim=1) # 1024 * 768 each. each include 12 heads' matrix in horizaontal direction. ex: Q == (head 1 q weight) (head 2 q weight) ... (head 12 q weight)
 
+    # Split Q, K, V into multiple heads for multi-head attention
+    Q = Q.view(T, n_head, head_dim).transpose(0, 1) # 12 * 1024 * 64
+    K = K.view(T, n_head, head_dim).transpose(0, 1) # 12 * 1024 * 64
+    V = V.view(T, n_head, head_dim).transpose(0, 1) # 12 * 1024 * 64
+    
     # Attention matrix
-    attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / (64 ** 0.5) # 1024 * 1024, scaled by sqrt of head dimension (64) to stabilize calculations
-    attn_probs = torch.softmax(attn_scores, dim=-1) # 1024 * 1024
-    value_output = torch.matmul(attn_probs, V) # 1024 * 768
+    mask = model_weights[f"h.{layer_idx}.attn.bias"] # 1 * 1 * 1024 * 1024, attention mask
+    mask = mask[0, 0, :T, :T] 
+
+    attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / (head_dim ** 0.5) # 12 * 1024 * 1024, scaled by sqrt of head dimension (64) to stabilize calculations
+    attn_scores = attn_scores.masked_fill(mask == 0, float('-inf')) # apply the attention mask before softmax
+
+    attn_probs = torch.softmax(attn_scores, dim=-1) # 12 * 1024 * 1024
+    
+    value_output = torch.matmul(attn_probs, V) # 12 * 1024 * 64
+    value_output = value_output.transpose(0, 1).contiguous().view(T, n_head * head_dim) # 1024 * 768, merge the head back
     attention_output = torch.matmul(value_output, proj_w) + proj_b # 1024 * 768
     x = original_x + attention_output # residual connection
 
@@ -103,13 +117,35 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
     mlp_proj_b = model_weights[f"h.{layer_idx}.mlp.c_proj.bias"] # 768
 
     mlp = torch.matmul(x, mlp_w) + mlp_b # 1024 * 3072
-    mlp_activation = torch.nn.GELU()(mlp) # activation
+    mlp_activation = torch.nn.GELU(approximate='tanh')(mlp) # activation
     mlp_result = torch.matmul(mlp_activation, mlp_proj_w) + mlp_proj_b # 1024 * 768
     x = original_x + mlp_result
 
     return x
 
-x = construct_input_tensor("Hello World")
-x = transformer_block(x, 1)
+x = construct_input_tensor("How are")
 
-print(x)
+for transformer_layer in range(12):
+    x = transformer_block(x, transformer_layer)
+
+# Output
+
+## Layer Norm (Final)
+ln = nn.LayerNorm(768, eps=1e-5)
+with torch.no_grad():
+    ln.weight.copy_(model_weights[f"ln_f.weight"])
+    ln.bias.copy_(model_weights[f"ln_f.bias"])
+x = ln(x) # 1024 * 768
+
+## Logits
+wte = model_weights["wte.weight"] # 50257 * 768
+logits = torch.matmul(x, wte.t()) # 1024 * 50257
+
+## softmax
+## every row is the next token probability (it is the training objective). so we take the last row for the next token prediction
+next_token_probs = torch.softmax(logits[-1], dim=-1) # 1024 (sequence length) * 50257
+
+## decode the next token
+next_token = torch.argmax(next_token_probs).item()
+
+print(tokenizer.decode(next_token))
