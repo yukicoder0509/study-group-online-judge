@@ -10,6 +10,15 @@ import torch.nn as nn
 # Attention Matrix multiplication visualization
 # See: https://pytorch.org/blog/inside-the-matrix/
 
+# Load the model for inference
+print("loading models...")
+tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+
+weight_path = hf_hub_download(repo_id="openai-community/gpt2", filename="model.safetensors")
+
+model_weights = load_file(weight_path)
+print("models loaded.")
+
 def gpt2_complete(
     input: list[str],
     max_seq_length: int = 1024,
@@ -25,39 +34,66 @@ def gpt2_complete(
     logits shaped (batch_size, decoding_steps, 50257). Fill logits with zero
     after a row has finished while other rows continue.
     """
-    raise NotImplementedError("Implement GPT-2 Small here")
 
-# Prepare the model for inference
+    # print(f"input = {input}")
 
-tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
+    output_text: list[str] = ["" for _ in input]
+    output_logits: list[list[torch.Tensor]] = [[] for _ in input]
+    max_output_length = 0
 
-weight_path = hf_hub_download(repo_id="openai-community/gpt2", filename="model.safetensors")
+    for i, input_text in enumerate(input):
+        # print(f"i = {i}")
+        while True:
+            # print(f"input_text = {input_text}")
+            input_tokens = construct_input_tensor(input_text, max_seq_length)
 
-model_weights = load_file(weight_path)
+            # print(input_tokens.size(0))
+            if input_tokens.size(0) >= max_seq_length:
+                break
 
-def construct_input_tensor(input: str):
+            next_word, next_word_probs = predict_next_token(input_tokens)
+
+            if next_word == tokenizer.eos_token:
+                break
+
+            # record for output
+            output_logits[i].append(next_word_probs)
+            output_text[i] += next_word
+
+            # update the input text with the newly predicted word
+            input_text += next_word
+            max_output_length = max(max_output_length, len(output_logits[i]))
+
+    # append zero logits for sequences that have finished early
+    for i, logits in enumerate(output_logits):
+        if logits:
+            seq_len = logits[0].size(0)
+            while len(logits) < max_output_length:
+                output_logits[i].append(torch.zeros_like(logits[0]))
+
+    return output_text, torch.stack([torch.stack(logits) for logits in output_logits])
+    # raise NotImplementedError("Implement GPT-2 Small here")
+
+def construct_input_tensor(input: str, max_seq_length: int = 1024):
     '''
     output: token embedding + positional embedding
-    output shapt: 1024 * 768
+    output shape: max_seq_length * 768
     '''
     # tokenize and encode
-    tokens = tokenizer.encode(input)
+    tokens = tokenizer.encode(input)[:max_seq_length]
 
     # transform into embedding
     tokens = [model_weights["wte.weight"][t] for t in tokens] # wte.weight is the word embedding for each token id
     tokens = torch.stack(tokens)
 
     # add positional embeddings
-    positions = torch.arange(tokens.size(0)) # create a tensor of position. [0, 1, 2, ...]
+    positions = torch.arange(tokens.size(0)) # create a tensor of position. [0, 1, 2, ..., len(tokens) - 1]
     positions = [model_weights["wpe.weight"][p] for p in positions] # wpe.weight is the positional embedding for each position
     positions = torch.stack(positions)
 
     tokens = tokens + positions
 
     return tokens
-
-# shared layers
-layer_norm = nn.LayerNorm(768)
 
 def transformer_block(x: torch.Tensor, layer_idx: int):
     original_x = x.clone() # save the original input for residual connection
@@ -123,29 +159,37 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
 
     return x
 
-x = construct_input_tensor("How are")
+def predict_next_token(input_tokens):
+    x = input_tokens
 
-for transformer_layer in range(12):
-    x = transformer_block(x, transformer_layer)
+    for transformer_layer in range(12):
+        x = transformer_block(x, transformer_layer)
 
-# Output
+    # Output
 
-## Layer Norm (Final)
-ln = nn.LayerNorm(768, eps=1e-5)
-with torch.no_grad():
-    ln.weight.copy_(model_weights[f"ln_f.weight"])
-    ln.bias.copy_(model_weights[f"ln_f.bias"])
-x = ln(x) # 1024 * 768
+    ## Layer Norm (Final)
+    ln = nn.LayerNorm(768, eps=1e-5)
+    with torch.no_grad():
+        ln.weight.copy_(model_weights[f"ln_f.weight"])
+        ln.bias.copy_(model_weights[f"ln_f.bias"])
+    x = ln(x) # 1024 * 768
 
-## Logits
-wte = model_weights["wte.weight"] # 50257 * 768
-logits = torch.matmul(x, wte.t()) # 1024 * 50257
+    ## Logits
+    wte = model_weights["wte.weight"] # 50257 * 768
+    logits = torch.matmul(x, wte.t()) # 1024 * 50257
 
-## softmax
-## every row is the next token probability (it is the training objective). so we take the last row for the next token prediction
-next_token_probs = torch.softmax(logits[-1], dim=-1) # 1024 (sequence length) * 50257
+    ## softmax
+    ## every row is the next token probability (it is the training objective). so we take the last row for the next token prediction
+    next_token_probs = torch.softmax(logits[-1], dim=-1) # 1024 (sequence length) * 50257
 
-## decode the next token
-next_token = torch.argmax(next_token_probs).item()
+    ## decode the next token
+    next_token = torch.argmax(next_token_probs).item()
 
-print(tokenizer.decode(next_token))
+    return tokenizer.decode(next_token), next_token_probs
+
+if __name__ == "__main__":
+    text, logits = gpt2_complete(input=["Hello, my name is", "How are"], max_seq_length=10)
+    print(text)
+
+    # print(tokenizer.decode(tokenizer.eos_token_id))
+    # print(tokenizer.eos_token)
