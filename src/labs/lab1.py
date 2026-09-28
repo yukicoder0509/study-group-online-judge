@@ -185,7 +185,7 @@ def predict_next_token(input_tokens):
     ## decode the next token
     next_token = torch.argmax(next_token_probs).item()
 
-    return tokenizer.decode(next_token), logits
+    return tokenizer.decode(next_token), logits[-1]
 
 if __name__ == "__main__":
     text, logits = gpt2_complete(input=["Hello, my name is", "How are"], max_seq_length=10)
