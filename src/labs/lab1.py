@@ -51,13 +51,13 @@ def gpt2_complete(
             if input_tokens.size(0) >= max_seq_length:
                 break
 
-            next_word, next_word_probs = predict_next_token(input_tokens)
+            next_word, next_token_logits = predict_next_token(input_tokens)
 
             if next_word == tokenizer.eos_token:
                 break
 
             # record for output
-            output_logits[i].append(next_word_probs)
+            output_logits[i].append(next_token_logits)
             output_text[i] += next_word
 
             # update the input text with the newly predicted word
@@ -185,7 +185,7 @@ def predict_next_token(input_tokens):
     ## decode the next token
     next_token = torch.argmax(next_token_probs).item()
 
-    return tokenizer.decode(next_token), next_token_probs
+    return tokenizer.decode(next_token), logits
 
 if __name__ == "__main__":
     text, logits = gpt2_complete(input=["Hello, my name is", "How are"], max_seq_length=10)
