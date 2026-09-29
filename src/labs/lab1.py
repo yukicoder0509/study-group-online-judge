@@ -42,6 +42,7 @@ def gpt2_complete(
     max_output_length = 0
 
     for i, input_text in enumerate(input):
+        print(f"input_text {i} = {input_text}")
         # print(f"i = {i}")
         while True:
             # print(f"input_text = {input_text}")
@@ -188,8 +189,13 @@ def predict_next_token(input_tokens):
     return tokenizer.decode(next_token), logits[-1]
 
 if __name__ == "__main__":
-    text, logits = gpt2_complete(input=["Hello, my name is", "How are"], max_seq_length=10)
-    print(text)
+    text = "stupid to"
+    x = construct_input_tensor(text)
+    next_word, next_token_logits = predict_next_token(x)
+    
+    topk = torch.topk(next_token_logits, 5)
+    for score, tok in zip(topk.values, topk.indices):
+      print(repr(tokenizer.decode(tok.item())), score.item())
 
     # print(tokenizer.decode(tokenizer.eos_token_id))
     # print(tokenizer.eos_token)
