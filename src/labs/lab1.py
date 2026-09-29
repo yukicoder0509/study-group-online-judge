@@ -17,6 +17,9 @@ tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
 weight_path = hf_hub_download(repo_id="openai-community/gpt2", filename="model.safetensors")
 
 model_weights = load_file(weight_path)
+# CI verifies logits against HF's stock GPT-2 run in fp16 on CPU, so run the
+# whole forward pass in the same numeric regime to match its roundings.
+model_weights = {k: v.half() for k, v in model_weights.items()}
 print("models loaded.")
 
 def gpt2_complete(
@@ -68,7 +71,6 @@ def gpt2_complete(
     # append zero logits for sequences that have finished early
     for i, logits in enumerate(output_logits):
         if logits:
-            seq_len = logits[0].size(0)
             while len(logits) < max_output_length:
                 output_logits[i].append(torch.zeros_like(logits[0]))
 
@@ -99,13 +101,14 @@ def construct_input_tensor(input: str, max_seq_length: int = 1024):
 def transformer_block(x: torch.Tensor, layer_idx: int):
     original_x = x.clone() # save the original input for residual connection
 
-    # Layer norm 1
-    with torch.no_grad():
-        ln_1 = nn.LayerNorm(768, eps=1e-5)
-        ln_1.weight.copy_(model_weights[f"h.{layer_idx}.ln_1.weight"])
-        ln_1.bias.copy_(model_weights[f"h.{layer_idx}.ln_1.bias"])
-
-    x = ln_1(x) # 1024 * 768
+    # Layer norm 1 (run in fp16; F.layer_norm keeps the input dtype instead of
+    # silently upcasting through nn.LayerNorm's float32 parameters)
+    x = nn.functional.layer_norm(
+        x, (768,),
+        model_weights[f"h.{layer_idx}.ln_1.weight"],
+        model_weights[f"h.{layer_idx}.ln_1.bias"],
+        eps=1e-5,
+    ) # 1024 * 768
 
     # Self attention block
     n_head, head_dim, T = 12, 64, x.size(0)
@@ -115,7 +118,7 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
     proj_w = model_weights[f"h.{layer_idx}.attn.c_proj.weight"] # 768 * 768
     proj_b = model_weights[f"h.{layer_idx}.attn.c_proj.bias"] # 768
 
-    qkv = torch.matmul(x, W) + b # 1024 * 2304
+    qkv = torch.addmm(b, x, W) # 1024 * 2304; fused bias-add mirrors HF's Conv1D
     Q, K, V = qkv.split(768, dim=1) # 1024 * 768 each. each include 12 heads' matrix in horizaontal direction. ex: Q == (head 1 q weight) (head 2 q weight) ... (head 12 q weight)
 
     # Split Q, K, V into multiple heads for multi-head attention
@@ -134,18 +137,18 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
     
     value_output = torch.matmul(attn_probs, V) # 12 * 1024 * 64
     value_output = value_output.transpose(0, 1).contiguous().view(T, n_head * head_dim) # 1024 * 768, merge the head back
-    attention_output = torch.matmul(value_output, proj_w) + proj_b # 1024 * 768
+    attention_output = torch.addmm(proj_b, value_output, proj_w) # 1024 * 768
     x = original_x + attention_output # residual connection
 
     original_x = x.clone() # save the original input for residual connection
 
-    # Layer norm 2
-    with torch.no_grad():
-        ln_2 = nn.LayerNorm(768, eps=1e-5)
-        ln_2.weight.copy_(model_weights[f"h.{layer_idx}.ln_2.weight"])
-        ln_2.bias.copy_(model_weights[f"h.{layer_idx}.ln_2.bias"])
-
-    x = ln_2(x)
+    # Layer norm 2 (fp16, see note on layer norm 1)
+    x = nn.functional.layer_norm(
+        x, (768,),
+        model_weights[f"h.{layer_idx}.ln_2.weight"],
+        model_weights[f"h.{layer_idx}.ln_2.bias"],
+        eps=1e-5,
+    )
 
     # Feed-forward MLP
     mlp_w = model_weights[f"h.{layer_idx}.mlp.c_fc.weight"] # 768 * 3072
@@ -153,10 +156,9 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
     mlp_proj_w = model_weights[f"h.{layer_idx}.mlp.c_proj.weight"] # 3072 * 768
     mlp_proj_b = model_weights[f"h.{layer_idx}.mlp.c_proj.bias"] # 768
 
-    mlp = torch.matmul(x, mlp_w) + mlp_b # 1024 * 3072
-    # mlp_activation = torch.nn.GELU(approximate='tanh')(mlp) # activation
-    mlp_activation = torch.nn.GELU()(mlp) # activation
-    mlp_result = torch.matmul(mlp_activation, mlp_proj_w) + mlp_proj_b # 1024 * 768
+    mlp = torch.addmm(mlp_b, x, mlp_w) # 1024 * 3072
+    mlp_activation = torch.nn.GELU(approximate='tanh')(mlp) # activation
+    mlp_result = torch.addmm(mlp_proj_b, mlp_activation, mlp_proj_w) # 1024 * 768
     x = original_x + mlp_result
 
     return x
@@ -169,12 +171,13 @@ def predict_next_token(input_tokens):
 
     # Output
 
-    ## Layer Norm (Final)
-    ln = nn.LayerNorm(768, eps=1e-5)
-    with torch.no_grad():
-        ln.weight.copy_(model_weights[f"ln_f.weight"])
-        ln.bias.copy_(model_weights[f"ln_f.bias"])
-    x = ln(x) # 1024 * 768
+    ## Layer Norm (Final, fp16)
+    x = nn.functional.layer_norm(
+        x, (768,),
+        model_weights["ln_f.weight"],
+        model_weights["ln_f.bias"],
+        eps=1e-5,
+    ) # 1024 * 768
 
     ## Logits
     wte = model_weights["wte.weight"] # 50257 * 768
