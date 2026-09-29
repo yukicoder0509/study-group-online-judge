@@ -154,7 +154,8 @@ def transformer_block(x: torch.Tensor, layer_idx: int):
     mlp_proj_b = model_weights[f"h.{layer_idx}.mlp.c_proj.bias"] # 768
 
     mlp = torch.matmul(x, mlp_w) + mlp_b # 1024 * 3072
-    mlp_activation = torch.nn.GELU(approximate='tanh')(mlp) # activation
+    # mlp_activation = torch.nn.GELU(approximate='tanh')(mlp) # activation
+    mlp_activation = torch.nn.GELU()(mlp) # activation
     mlp_result = torch.matmul(mlp_activation, mlp_proj_w) + mlp_proj_b # 1024 * 768
     x = original_x + mlp_result
 
@@ -189,7 +190,7 @@ def predict_next_token(input_tokens):
     return tokenizer.decode(next_token), logits[-1]
 
 if __name__ == "__main__":
-    text = "stupid to"
+    text = "but they think we are too stupid to"
     x = construct_input_tensor(text)
     next_word, next_token_logits = predict_next_token(x)
     
