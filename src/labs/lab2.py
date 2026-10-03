@@ -1,3 +1,4 @@
+from lab1 import gpt2_complete
 def mmlu_eval() -> dict[str, str]:
     """Return GPT-2's A/B/C/D prediction for every MMLU test question.
 
